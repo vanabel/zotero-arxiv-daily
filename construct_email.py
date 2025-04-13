@@ -7,138 +7,282 @@ from email.utils import parseaddr, formataddr
 import smtplib
 import datetime
 from loguru import logger
+from typing import List
+import time
+from llm import get_llm
+from cache import PaperCache
+
+# 初始化缓存
+paper_cache = PaperCache()
 
 framework = """
-<!DOCTYPE HTML>
+<!DOCTYPE html>
 <html>
 <head>
-  <style>
-    .star-wrapper {
-      font-size: 1.3em; /* 调整星星大小 */
-      line-height: 1; /* 确保垂直对齐 */
-      display: inline-flex;
-      align-items: center; /* 保持对齐 */
-    }
-    .half-star {
-      display: inline-block;
-      width: 0.5em; /* 半颗星的宽度 */
-      overflow: hidden;
-      white-space: nowrap;
-      vertical-align: middle;
-    }
-    .full-star {
-      vertical-align: middle;
-    }
-  </style>
+    <meta charset="UTF-8">
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            max-width: 800px;
+            margin: 20px auto;
+            padding: 0 20px;
+            background: #f5f5f5;
+            color: #333;
+        }
+        ol {
+            padding: 0;
+            margin: 0;
+            list-style-position: outside;
+            padding-left: 2em;
+        }
+        .paper {
+            padding: 20px 0;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            position: relative;
+            margin-left: 0;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 10px;
+        }
+        .title {
+            font-size: 1.2em;
+            font-weight: bold;
+            flex: 1;
+            margin-right: 20px;
+            padding-left: 0;
+        }
+        .title a {
+            color: #2c3e50;
+            text-decoration: none;
+        }
+        .title a:hover {
+            text-decoration: underline;
+        }
+        .rate {
+            white-space: nowrap;
+            color: #666;
+        }
+        .stars {
+            color: #f1c40f;
+            letter-spacing: 2px;
+        }
+        .similarity {
+            font-size: 0.9em;
+            color: #666;
+            margin-top: 5px;
+        }
+        .meta {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            font-size: 0.9em;
+        }
+        .authors {
+            color: #666;
+            font-style: italic;
+            flex: 1;
+            margin-right: 20px;
+        }
+        .links {
+            white-space: nowrap;
+        }
+        .links a {
+            display: inline-block;
+            padding: 4px 8px;
+            margin-left: 8px;
+            background: #3498db;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+            font-size: 0.9em;
+        }
+        .links a:hover {
+            background: #2980b9;
+        }
+        .abstract {
+            line-height: 1.5;
+            color: #444;
+        }
+        .empty-result {
+            text-align: center;
+            padding: 40px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .empty-result h2 {
+            color: #2c3e50;
+            margin-bottom: 20px;
+        }
+        .empty-result p {
+            color: #666;
+        }
+    </style>
 </head>
 <body>
-
-<div>
-    __CONTENT__
-</div>
-
-<br><br>
-<div>
-To unsubscribe, remove your email in your Github Action setting.
-</div>
-
+    <h1>今日 arXiv 论文推荐</h1>
+    <ol>
+        __CONTENT__
+    </ol>
 </body>
 </html>
 """
 
-def get_empty_html():
-  block_template = """
-  <table border="0" cellpadding="0" cellspacing="0" width="100%" style="font-family: Arial, sans-serif; border: 1px solid #ddd; border-radius: 8px; padding: 16px; background-color: #f9f9f9;">
-  <tr>
-    <td style="font-size: 20px; font-weight: bold; color: #333;">
-        No Papers Today. Take a Rest!
-    </td>
-  </tr>
-  </table>
-  """
-  return block_template
+def get_empty_html() -> str:
+    """生成空结果的 HTML"""
+    return """
+    <div class="empty-result">
+        <h2>没有找到相关论文</h2>
+        <p>今天没有与您的兴趣相关的新论文。请明天再来查看！</p>
+    </div>
+    """
 
-def get_block_html(title:str, authors:str, rate:str,arxiv_id:str, abstract:str, pdf_url:str, code_url:str=None, affiliations:str=None):
-    code = f'<a href="{code_url}" style="display: inline-block; text-decoration: none; font-size: 14px; font-weight: bold; color: #fff; background-color: #5bc0de; padding: 8px 16px; border-radius: 4px; margin-left: 8px;">Code</a>' if code_url else ''
-    block_template = """
-    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="font-family: Arial, sans-serif; border: 1px solid #ddd; border-radius: 8px; padding: 16px; background-color: #f9f9f9;">
-    <tr>
-        <td style="font-size: 20px; font-weight: bold; color: #333;">
-            {title}
-        </td>
-    </tr>
-    <tr>
-        <td style="font-size: 14px; color: #666; padding: 8px 0;">
-            {authors}
-            <br>
-            <i>{affiliations}</i>
-        </td>
-    </tr>
-    <tr>
-        <td style="font-size: 14px; color: #333; padding: 8px 0;">
-            <strong>Relevance:</strong> {rate}
-        </td>
-    </tr>
-    <tr>
-        <td style="font-size: 14px; color: #333; padding: 8px 0;">
-            <strong>arXiv ID:</strong> {arxiv_id}
-        </td>
-    </tr>
-    <tr>
-        <td style="font-size: 14px; color: #333; padding: 8px 0;">
-            <strong>TLDR:</strong> {abstract}
-        </td>
-    </tr>
-
-    <tr>
-        <td style="padding: 8px 0;">
-            <a href="{pdf_url}" style="display: inline-block; text-decoration: none; font-size: 14px; font-weight: bold; color: #fff; background-color: #d9534f; padding: 8px 16px; border-radius: 4px;">PDF</a>
-            {code}
-        </td>
-    </tr>
-</table>
-"""
-    return block_template.format(title=title, authors=authors,rate=rate,arxiv_id=arxiv_id, abstract=abstract, pdf_url=pdf_url, code=code, affiliations=affiliations)
-
-def get_stars(score:float):
-    full_star = '<span class="full-star">⭐</span>'
-    half_star = '<span class="half-star">⭐</span>'
-    low = 6
-    high = 8
-    if score <= low:
-        return ''
-    elif score >= high:
-        return full_star * 5
-    else:
-        interval = (high-low) / 10
-        star_num = math.ceil((score-low) / interval)
-        full_star_num = int(star_num/2)
-        half_star_num = star_num - full_star_num * 2
-        return '<div class="star-wrapper">'+full_star * full_star_num + half_star * half_star_num + '</div>'
-
-
-def render_email(papers:list[ArxivPaper]):
-    parts = []
-    if len(papers) == 0 :
-        return framework.replace('__CONTENT__', get_empty_html())
+def get_block_html(title: str, authors: str, rate: str, arxiv_id: str, abstract: str, pdf_url: str, code_url: str = None, similarity: float = None) -> str:
+    """生成单个论文的 HTML 块
     
-    for p in tqdm(papers,desc='Rendering Email'):
-        rate = get_stars(p.score)
-        authors = [a.name for a in p.authors[:5]]
-        authors = ', '.join(authors)
-        if len(p.authors) > 5:
-            authors += ', ...'
-        if p.affiliations is not None:
-            affiliations = p.affiliations[:5]
-            affiliations = ', '.join(affiliations)
-            if len(p.affiliations) > 5:
-                affiliations += ', ...'
-        else:
-            affiliations = 'Unknown Affiliation'
-        parts.append(get_block_html(p.title, authors,rate,p.arxiv_id ,p.tldr, p.pdf_url, p.code_url, affiliations))
+    Args:
+        title: 论文标题
+        authors: 作者列表
+        rate: 相关性评分（星星）
+        arxiv_id: arXiv ID
+        abstract: 摘要
+        pdf_url: PDF 链接
+        code_url: 代码链接（可选）
+        similarity: 相似度分数（可选）
+        
+    Returns:
+        str: HTML 块
+    """
+    # 构建代码链接 HTML
+    code_html = f'<a href="{code_url}" target="_blank">Code</a>' if code_url else ''
+    
+    # 构建相似度信息 HTML
+    similarity_html = f'<div class="similarity">相似度: {similarity:.2f}</div>' if similarity is not None else ''
+    
+    return f"""
+    <li>
+        <div class="paper">
+            <div class="header">
+                <div class="title">
+                    <a href="https://arxiv.org/abs/{arxiv_id}" target="_blank">{title}</a>
+                </div>
+                <div class="rate">
+                    <div>相关度：<span class="stars">{rate}</span></div>
+                    {similarity_html}
+                </div>
+            </div>
+            <div class="meta">
+                <div class="authors">{authors}</div>
+                <div class="links">
+                    <a href="{pdf_url}" target="_blank">PDF</a>
+                    {code_html}
+                </div>
+            </div>
+            <div class="abstract">{abstract}</div>
+        </div>
+    </li>
+    """
 
-    content = '<br>' + '</br><br>'.join(parts) + '</br>'
-    return framework.replace('__CONTENT__', content)
+def get_stars(score: float) -> str:
+    """根据相关性分数生成星星评分
+    
+    Args:
+        score: 相关性分数 (0-1)
+        
+    Returns:
+        str: 星星评分字符串
+    """
+    # 将分数转换为 1-5 星
+    stars = min(5, max(1, round(score * 5)))
+    # 使用 HTML 实体编码的星星
+    return "★" * stars + "☆" * (5 - stars)
+
+def save_html_output(html: str, output_path: str = "output-email.html") -> None:
+    """Save the HTML content to a file
+    
+    Args:
+        html: The HTML content to save
+        output_path: The path to save the HTML file (default: output-email.html)
+    """
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(html)
+        logger.info(f"Email content saved to {output_path}")
+        logger.info(f"You can open this file in a web browser to preview the email content")
+    except Exception as e:
+        logger.error(f"Failed to save HTML output: {e}")
+
+def render_email(papers: List[ArxivPaper]) -> str:
+    """渲染邮件内容"""
+    logger.info("Rendering email content...")
+    
+    if not papers:
+        html = get_empty_html()
+        save_html_output(html)
+        return html
+    
+    # 设置 LLM 模型
+    llm = get_llm()
+    logger.info(f"Using {llm.model} for TLDR generation")
+    
+    # 渲染每篇论文
+    blocks = []
+    for paper in tqdm(papers, desc="Processing papers", unit="paper"):
+        logger.debug(f"Processing paper: {paper.title}")
+        
+        # 获取 TLDR
+        tldr = None
+        paper_id = paper.get_short_id()
+        
+        # Check if we can use cached TLDR
+        if paper_cache.can_use_cached_tldr(paper_id, paper.score):
+            tldr = paper_cache.get_tldr(paper_id)
+            if tldr is not None:
+                logger.debug(f"Using cached TLDR for {paper.title} (score: {paper.score:.2f})")
+        
+        # If no cached TLDR or score changed significantly, generate new one
+        if tldr is None:
+            try:
+                tldr = llm.get_tldr(paper.title, paper.summary)
+                paper_cache.save_tldr(paper_id, tldr)
+                logger.debug(f"Generated new TLDR for {paper.title} (score: {paper.score:.2f})")
+            except Exception as e:
+                logger.error(f"Failed to generate TLDR for {paper.title}: {e}")
+                tldr = "Failed to generate TLDR"
+        
+        # 获取代码链接
+        code_url = paper.code_url
+        
+        # 获取相关性评分的星星显示
+        stars = get_stars(paper.score)
+        
+        # 构建论文 HTML 块
+        block = get_block_html(
+            title=paper.title,
+            authors=', '.join(paper.authors),
+            rate=stars,
+            arxiv_id=paper_id,
+            abstract=tldr,
+            pdf_url=paper.pdf_url,
+            code_url=code_url,
+            similarity=paper.score  # Add similarity score
+        )
+        blocks.append(block)
+    
+    # 使用框架模板
+    content = '<br>'.join(blocks)
+    html = framework.replace('__CONTENT__', content)
+    
+    # Save the HTML output to a file
+    save_html_output(html)
+    
+    return html
 
 def send_email(sender:str, receiver:str, password:str,smtp_server:str,smtp_port:int, html:str,):
     def _format_addr(s):
@@ -149,7 +293,10 @@ def send_email(sender:str, receiver:str, password:str,smtp_server:str,smtp_port:
     msg['From'] = _format_addr('Github Action <%s>' % sender)
     msg['To'] = _format_addr('You <%s>' % receiver)
     today = datetime.datetime.now().strftime('%Y/%m/%d')
-    msg['Subject'] = Header(f'Daily arXiv {today}', 'utf-8').encode()
+    msg['Subject'] = Header(f'每日 arXiv 论文推荐 {today}', 'utf-8').encode()
+    # 添加额外的头信息以确保正确的字符编码
+    msg['Content-Type'] = 'text/html; charset=utf-8'
+    msg['MIME-Version'] = '1.0'
 
     try:
         server = smtplib.SMTP(smtp_server, smtp_port)
