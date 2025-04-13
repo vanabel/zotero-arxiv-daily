@@ -281,50 +281,82 @@ if __name__ == '__main__':
         logger.remove()
         logger.add(sys.stdout, level="INFO", format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>")
 
+    # 获取 Zotero 语料库
     logger.info("Retrieving Zotero corpus...")
-    corpus = get_zotero_corpus(args.zotero_id, args.zotero_key)
-    logger.info(f"Retrieved {len(corpus)} papers from Zotero.")
+    zotero_corpus = get_zotero_corpus(args.zotero_id, args.zotero_key)
+    logger.info(f"Retrieved {len(zotero_corpus)} papers from Zotero.")
     if args.zotero_ignore:
         logger.info(f"Ignoring papers in:\n {args.zotero_ignore}...")
-        corpus = filter_corpus(corpus, args.zotero_ignore)
-        logger.info(f"Remaining {len(corpus)} papers after filtering.")
+        zotero_corpus = filter_corpus(zotero_corpus, args.zotero_ignore)
+        logger.info(f"Remaining {len(zotero_corpus)} papers after filtering.")
+
+    # 获取 arXiv 论文
     logger.info("Retrieving Arxiv papers...")
-    papers = get_arxiv_paper(args.arxiv_query, args.debug)
-    if len(papers) == 0:
+    arxiv_papers = get_arxiv_paper(args.arxiv_query, args.debug)
+    if len(arxiv_papers) == 0:
         logger.info("No new papers found. Yesterday maybe a holiday and no one submit their work :). If this is not the case, please check the ARXIV_QUERY.")
         if not args.send_empty:
           exit(0)
-    else:
-        logger.info("Reranking papers...")
-        papers = rerank_paper(papers, corpus)
-        if args.max_paper_num != -1:
-            papers = papers[:args.max_paper_num]
-        if args.use_llm_api:
-            logger.info("Using OpenAI API as global LLM.")
-            set_global_llm(api_key=args.openai_api_key, base_url=args.openai_api_base, model=args.model_name, lang=args.language)
-        else:
-            logger.info("Using Local LLM as global LLM.")
-            set_global_llm(lang=args.language)
+
+    # 重新排序论文
+    logger.info(f"Processing {len(arxiv_papers)} papers for similarity matching...")
+    reranked_papers = rerank_paper(arxiv_papers, zotero_corpus)
+    if args.max_paper_num != -1:
+        reranked_papers = reranked_papers[:args.max_paper_num]
 
     # 在发送邮件之前，对论文进行排序并只保留前10篇
-    if len(papers) > 0:
-        total_papers = len(papers)
+    if len(reranked_papers) > 0:
+        total_papers = len(reranked_papers)
         # 按相关性得分排序
-        papers.sort(key=lambda x: x.score if hasattr(x, 'score') else 0, reverse=True)
+        reranked_papers.sort(key=lambda x: x.score if hasattr(x, 'score') else 0, reverse=True)
         # 只保留前10篇最相关的论文
-        papers = papers[:10]
+        reranked_papers = reranked_papers[:10]
         
         logger.info(f"Selected top 10 most relevant papers from {total_papers} papers.")
-        html = render_email(papers)
+        
+        # 初始化 LLM (用于 TLDR 生成)
+        logger.info("Initializing LLM for TLDR generation...")
+        if os.getenv('USE_LLM_API', '0') == '1':
+            logger.info("Using API LLM for TLDR generation.")
+            set_global_llm(
+                api_key=os.getenv('OPENAI_API_KEY'),
+                base_url=os.getenv('OPENAI_API_BASE'),
+                model=os.getenv('OPENAI_API_MODEL'),
+                lang=os.getenv('LANG', 'English')
+            )
+        else:
+            logger.info(f"Using Local LLM ({os.getenv('TLDR_MODEL_NAME', 'Qwen/Qwen2.5-3B-Instruct-GGUF')}) for TLDR generation.")
+            set_global_llm(lang=os.getenv('LANG', 'English'))
+        
+        # 生成邮件内容
+        logger.info("Generating email content...")
+        html = render_email(reranked_papers, lang=os.getenv('LANG', 'English'))
+        
         if args.no_email_send:
             logger.info("Email sending disabled. Content has been saved to output-email.html")
         else:
             logger.info("Sending email...")
-            send_email(args.sender, args.receiver, args.sender_password, args.smtp_server, args.smtp_port, html)
+            send_email(
+                sender=args.sender,
+                receiver=args.receiver,
+                password=args.sender_password,
+                smtp_server=args.smtp_server,
+                smtp_port=args.smtp_port,
+                html=html,
+                lang=os.getenv('LANG', 'English')
+            )
             logger.success("Email sent successfully! If you don't receive the email, please check the configuration and the junk box.")
     else:
         logger.warning("No papers found.")
-        html = render_email([])
+        html = render_email([], lang=os.getenv('LANG', 'English'))
         if not args.no_email_send:
-            send_email(args.sender, args.receiver, args.sender_password, args.smtp_server, args.smtp_port, html)
+            send_email(
+                sender=args.sender,
+                receiver=args.receiver,
+                password=args.sender_password,
+                smtp_server=args.smtp_server,
+                smtp_port=args.smtp_port,
+                html=html,
+                lang=os.getenv('LANG', 'English')
+            )
 

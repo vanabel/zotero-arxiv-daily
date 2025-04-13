@@ -11,6 +11,11 @@ from typing import List
 import time
 from llm import get_llm
 from cache import PaperCache
+import os
+import re
+from bs4 import BeautifulSoup
+import requests
+from openai import OpenAI
 
 # 初始化缓存
 paper_cache = PaperCache()
@@ -124,67 +129,88 @@ framework = """
             color: #666;
         }
     </style>
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>
+        MathJax = {
+            tex: {
+                inlineMath: [['$', '$'], ['\\(', '\\)']],
+                displayMath: [['$$', '$$'], ['\\[', '\\]']],
+                processEscapes: true
+            },
+            svg: {
+                fontCache: 'global'
+            }
+        };
+    </script>
 </head>
 <body>
-    <h1>今日 arXiv 论文推荐</h1>
+    <h1>__TITLE__</h1>
     <ol>
-        __CONTENT__
+        __PAPERS__
     </ol>
 </body>
 </html>
 """
 
-def get_empty_html() -> str:
+def get_empty_html(lang: str = "English") -> str:
     """生成空结果的 HTML"""
-    return """
+    if lang.lower() == "chinese":
+        return """
     <div class="empty-result">
         <h2>没有找到相关论文</h2>
         <p>今天没有与您的兴趣相关的新论文。请明天再来查看！</p>
     </div>
     """
+    else:
+        return """
+    <div class="empty-result">
+        <h2>No related papers found</h2>
+        <p>No new papers related to your interests today. Please check back tomorrow!</p>
+    </div>
+    """
 
-def get_block_html(title: str, authors: str, rate: str, arxiv_id: str, abstract: str, pdf_url: str, code_url: str = None, similarity: float = None) -> str:
-    """生成单个论文的 HTML 块
+def get_block_html(paper: ArxivPaper, lang: str = "English") -> str:
+    """Generate HTML block for a single paper
     
     Args:
-        title: 论文标题
-        authors: 作者列表
-        rate: 相关性评分（星星）
-        arxiv_id: arXiv ID
-        abstract: 摘要
-        pdf_url: PDF 链接
-        code_url: 代码链接（可选）
-        similarity: 相似度分数（可选）
+        paper: ArxivPaper object
+        lang: Language for the content (default: "English")
         
     Returns:
-        str: HTML 块
+        str: HTML block
     """
-    # 构建代码链接 HTML
-    code_html = f'<a href="{code_url}" target="_blank">Code</a>' if code_url else ''
+    # Build similarity info HTML
+    if lang.lower() == "chinese":
+        rate_text = "相关度："
+        pdf_text = "PDF"
+        similarity_text = "相似度："
+    else:
+        rate_text = "Relevance: "
+        pdf_text = "PDF"
+        similarity_text = "Similarity: "
     
-    # 构建相似度信息 HTML
-    similarity_html = f'<div class="similarity">相似度: {similarity:.2f}</div>' if similarity is not None else ''
+    similarity_html = f'<div class="similarity">{similarity_text}{paper.score:.2f}</div>' if hasattr(paper, 'score') else ''
     
     return f"""
     <li>
         <div class="paper">
             <div class="header">
                 <div class="title">
-                    <a href="https://arxiv.org/abs/{arxiv_id}" target="_blank">{title}</a>
+                    <a href="https://arxiv.org/abs/{paper.get_short_id()}" target="_blank">{paper.title}</a>
                 </div>
                 <div class="rate">
-                    <div>相关度：<span class="stars">{rate}</span></div>
+                    <div>{rate_text}<span class="stars">{get_stars(paper.score)}</span></div>
                     {similarity_html}
                 </div>
             </div>
             <div class="meta">
-                <div class="authors">{authors}</div>
+                <div class="authors">{', '.join(paper.authors)}</div>
                 <div class="links">
-                    <a href="{pdf_url}" target="_blank">PDF</a>
-                    {code_html}
+                    <a href="{paper.pdf_url}" target="_blank">{pdf_text}</a>
                 </div>
             </div>
-            <div class="abstract">{abstract}</div>
+            <div class="abstract">{paper.tldr}</div>
         </div>
     </li>
     """
@@ -204,97 +230,126 @@ def get_stars(score: float) -> str:
     return "★" * stars + "☆" * (5 - stars)
 
 def save_html_output(html: str, output_path: str = "output-email.html") -> None:
-    """Save the HTML content to a file
-    
-    Args:
-        html: The HTML content to save
-        output_path: The path to save the HTML file (default: output-email.html)
-    """
+    """Save the HTML content to a file with both interactive and pre-rendered versions"""
+    # Save interactive version (with MathJax)
     try:
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(html)
-        logger.info(f"Email content saved to {output_path}")
-        logger.info(f"You can open this file in a web browser to preview the email content")
+        logger.info(f"Interactive email content saved to {output_path}")
+        
+        # Save pre-rendered version
+        pre_rendered_path = output_path.replace('.html', '-pre-rendered.html')
+        pre_rendered_html = pre_render_math(html)
+        with open(pre_rendered_path, 'w', encoding='utf-8') as f:
+            f.write(pre_rendered_html)
+        logger.info(f"Pre-rendered email content saved to {pre_rendered_path}")
+        
+        logger.info(f"You can open these files in a web browser to preview the email content")
     except Exception as e:
         logger.error(f"Failed to save HTML output: {e}")
 
-def render_email(papers: List[ArxivPaper]) -> str:
-    """渲染邮件内容"""
-    logger.info("Rendering email content...")
-    
+def render_email(papers: List[ArxivPaper], lang: str = "English") -> str:
+    """Render email content"""
     if not papers:
-        html = get_empty_html()
-        save_html_output(html)
-        return html
-    
-    # 设置 LLM 模型
+        return get_empty_html(lang)
+        
+    # Initialize LLM for TLDR generation
     llm = get_llm()
-    logger.info(f"Using {llm.model} for TLDR generation")
+    if isinstance(llm.llm, OpenAI):
+        logger.info(f"Using OpenAI API for TLDR generation (model: {llm.model})")
+    else:
+        logger.info(f"Using local LLM for TLDR generation: {llm.model}")
     
-    # 渲染每篇论文
-    blocks = []
-    for paper in tqdm(papers, desc="Processing papers", unit="paper"):
-        logger.debug(f"Processing paper: {paper.title}")
-        
-        # 获取 TLDR
-        tldr = None
-        paper_id = paper.get_short_id()
-        
-        # Check if we can use cached TLDR
-        if paper_cache.can_use_cached_tldr(paper_id, paper.score):
-            tldr = paper_cache.get_tldr(paper_id)
-            if tldr is not None:
-                logger.debug(f"Using cached TLDR for {paper.title} (score: {paper.score:.2f})")
-        
-        # If no cached TLDR or score changed significantly, generate new one
-        if tldr is None:
-            try:
-                tldr = llm.get_tldr(paper.title, paper.summary)
-                paper_cache.save_tldr(paper_id, tldr)
-                logger.debug(f"Generated new TLDR for {paper.title} (score: {paper.score:.2f})")
-            except Exception as e:
-                logger.error(f"Failed to generate TLDR for {paper.title}: {e}")
-                tldr = "Failed to generate TLDR"
-        
-        # 获取代码链接
-        code_url = paper.code_url
-        
-        # 获取相关性评分的星星显示
-        stars = get_stars(paper.score)
-        
-        # 构建论文 HTML 块
-        block = get_block_html(
-            title=paper.title,
-            authors=', '.join(paper.authors),
-            rate=stars,
-            arxiv_id=paper_id,
-            abstract=tldr,
-            pdf_url=paper.pdf_url,
-            code_url=code_url,
-            similarity=paper.score  # Add similarity score
-        )
-        blocks.append(block)
+    # Generate TLDR for each paper with progress bar
+    logger.info("Generating TLDR summaries...")
+    for paper in tqdm(papers, desc="Generating TLDRs"):
+        paper.tldr = llm.get_tldr(paper.title, paper.summary)
     
-    # 使用框架模板
-    content = '<br>'.join(blocks)
-    html = framework.replace('__CONTENT__', content)
+    # Render email content
+    html = framework
+    html = html.replace("__TITLE__", "ArXiv Daily Digest" if lang == "English" else "ArXiv 每日文摘")
     
-    # Save the HTML output to a file
+    # Add papers
+    papers_html = ""
+    for paper in papers:
+        papers_html += get_block_html(paper, lang)
+    
+    html = html.replace("__PAPERS__", papers_html)
     save_html_output(html)
-    
     return html
 
-def send_email(sender:str, receiver:str, password:str,smtp_server:str,smtp_port:int, html:str,):
-    def _format_addr(s):
-        name, addr = parseaddr(s)
-        return formataddr((Header(name, 'utf-8').encode(), addr))
+def pre_render_math(html_content: str) -> str:
+    """Pre-render math expressions to HTML using MathJax Node API"""
+    # Extract math expressions
+    inline_math = re.findall(r'\$([^$]+)\$', html_content)
+    display_math = re.findall(r'\$\$([^$]+)\$\$', html_content)
+    
+    # Replace math expressions with placeholders
+    math_expressions = inline_math + display_math
+    placeholders = []
+    for i, expr in enumerate(math_expressions):
+        placeholder = f'__MATH_{i}__'
+        html_content = html_content.replace(f'${expr}$', placeholder)
+        html_content = html_content.replace(f'$${expr}$$', placeholder)
+        placeholders.append(expr)
+    
+    # Use MathJax Node API to render math
+    rendered_math = []
+    for expr in placeholders:
+        try:
+            # Use MathJax Node API to render the expression
+            response = requests.post(
+                'https://mathjax-node.herokuapp.com/tex2svg',
+                json={'math': expr},
+                headers={'Content-Type': 'application/json'}
+            )
+            if response.status_code == 200:
+                rendered_math.append(response.text)
+            else:
+                rendered_math.append(f'<span class="math-error">Error rendering: {expr}</span>')
+        except Exception as e:
+            logger.error(f"Failed to render math expression: {expr}, error: {e}")
+            rendered_math.append(f'<span class="math-error">Error rendering: {expr}</span>')
+    
+    # Replace placeholders with rendered math
+    for i, rendered in enumerate(rendered_math):
+        html_content = html_content.replace(f'__MATH_{i}__', rendered)
+    
+    return html_content
+
+def send_email(sender: str, receiver: str, password: str, smtp_server: str, smtp_port: int, html: str, lang: str = "English"):
+    """Send email with pre-rendered math content
+    
+    Args:
+        sender: Email sender address
+        receiver: Email receiver address
+        password: Email password
+        smtp_server: SMTP server address
+        smtp_port: SMTP server port
+        html: HTML content to send
+        lang: Language for the email (default: "English")
+    """
+    # Pre-render math expressions
+    html = pre_render_math(html)
+    
+    def _format_addr(s, name):
+        return formataddr((Header(name, 'utf-8').encode(), s))
 
     msg = MIMEText(html, 'html', 'utf-8')
-    msg['From'] = _format_addr('Github Action <%s>' % sender)
-    msg['To'] = _format_addr('You <%s>' % receiver)
-    today = datetime.datetime.now().strftime('%Y/%m/%d')
-    msg['Subject'] = Header(f'每日 arXiv 论文推荐 {today}', 'utf-8').encode()
-    # 添加额外的头信息以确保正确的字符编码
+    
+    # Set sender and receiver names based on language
+    if lang.lower() == "chinese":
+        sender_name = "arXiv 论文推荐"
+        receiver_name = "您"
+        subject = f'每日 arXiv 论文推荐 {datetime.datetime.now().strftime("%Y/%m/%d")}'
+    else:
+        sender_name = "arXiv Paper Recommendations"
+        receiver_name = "You"
+        subject = f'Daily arXiv Paper Recommendations {datetime.datetime.now().strftime("%Y/%m/%d")}'
+    
+    msg['From'] = _format_addr(sender, sender_name)
+    msg['To'] = _format_addr(receiver, receiver_name)
+    msg['Subject'] = Header(subject, 'utf-8').encode()
     msg['Content-Type'] = 'text/html; charset=utf-8'
     msg['MIME-Version'] = '1.0'
 

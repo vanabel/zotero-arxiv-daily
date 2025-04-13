@@ -22,7 +22,7 @@ class EmbeddingProvider:
         
         # 初始化 model 属性
         self.model = None
-        self.model_name = os.getenv('EMBEDDING_MODEL', 'BAAI/bge-m3')
+        self.model_name = os.getenv('EMBEDDING_MODEL', 'allenai/specter2_base')
         
         if self.use_api:
             self._setup_api_client()
@@ -58,8 +58,8 @@ class EmbeddingProvider:
                 self.model = SentenceTransformer(self.model_name)
             except Exception as e:
                 logger.error(f"Error loading model {self.model_name}: {e}")
-                logger.warning("Falling back to BAAI/bge-m3")
-                self.model = SentenceTransformer('BAAI/bge-m3')
+                logger.warning("Falling back to allenai/specter2_base")
+                self.model = SentenceTransformer('allenai/specter2_base')
         return self.model
     
     def _encode_api_batch(self, texts: List[str]) -> List[List[float]]:
@@ -72,7 +72,11 @@ class EmbeddingProvider:
                         input=texts,
                         timeout=self.timeout
                     )
-                    return [embedding.embedding for embedding in response.data]
+                    # Ensure we return a list of lists
+                    embeddings = [embedding.embedding for embedding in response.data]
+                    if not isinstance(embeddings[0], list):
+                        embeddings = [embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding) for embedding in embeddings]
+                    return embeddings
                 except Exception as e:
                     logger.error(f"OpenAI API error: {str(e)}")
                     if hasattr(e, 'response') and hasattr(e.response, 'text'):
@@ -88,7 +92,11 @@ class EmbeddingProvider:
                     timeout=self.timeout
                 )
                 response.raise_for_status()
-                return response.json()
+                embeddings = response.json()
+                # Ensure we return a list of lists
+                if not isinstance(embeddings[0], list):
+                    embeddings = [embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding) for embedding in embeddings]
+                return embeddings
                 
         except Exception as e:
             logger.warning(f"API embedding failed ({self.api_type}): {e}")
@@ -114,20 +122,37 @@ class EmbeddingProvider:
                     all_embeddings.extend(embeddings)
                 return all_embeddings
             else:
-                return self._get_local_model().encode(
+                # Get embeddings from local model
+                embeddings = self._get_local_model().encode(
                     texts,
                     show_progress_bar=show_progress,
                     convert_to_numpy=False
-                ).tolist()
+                )
+                # Ensure we return a list of lists
+                if not isinstance(embeddings, list):
+                    embeddings = embeddings.tolist()
+                elif not isinstance(embeddings[0], list):
+                    embeddings = [embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding) for embedding in embeddings]
+                return embeddings
         except Exception as e:
             logger.error(f"Embedding error: {e}")
             # 如果出现错误，尝试使用本地模型
             logger.info("Attempting to use local model as fallback")
-            return self._get_local_model().encode(
-                texts,
-                show_progress_bar=show_progress,
-                convert_to_numpy=False
-            ).tolist()
+            try:
+                embeddings = self._get_local_model().encode(
+                    texts,
+                    show_progress_bar=show_progress,
+                    convert_to_numpy=False
+                )
+                # Ensure we return a list of lists
+                if not isinstance(embeddings, list):
+                    embeddings = embeddings.tolist()
+                elif not isinstance(embeddings[0], list):
+                    embeddings = [embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding) for embedding in embeddings]
+                return embeddings
+            except Exception as fallback_error:
+                logger.error(f"Fallback embedding error: {fallback_error}")
+                raise
 
 # 全局实例
 _global_provider = None

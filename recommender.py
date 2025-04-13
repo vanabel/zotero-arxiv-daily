@@ -72,15 +72,26 @@ def get_embeddings_batch(texts: List[str], model: str = None) -> List[List[float
     uncached_texts = [text for text, embedding in cached_results.items() if embedding is None]
     
     if not uncached_texts:
+        logger.info(f"Using cached embeddings for all {len(texts)} texts")
         return [cached_results[text] for text in texts]
     
     # Get embeddings for uncached texts
-    logger.info(f"Computing embeddings for {len(uncached_texts)} texts...")
+    logger.info(f"Found {len(uncached_texts)} uncached texts out of {len(texts)} total texts")
     provider = get_embedding_provider()
-    uncached_embeddings = provider.encode(uncached_texts, show_progress=True)
+    if provider.use_api:
+        logger.info(f"Using {provider.api_type} API for embeddings (model: {provider.api_model})")
+    else:
+        logger.info(f"Using local embedding model: {provider.model_name}")
+    
+    # Process in batches with progress bar
+    all_embeddings = []
+    for i in tqdm(range(0, len(uncached_texts), provider.batch_size), desc="Computing embeddings"):
+        batch = uncached_texts[i:i + provider.batch_size]
+        embeddings = provider.encode(batch, show_progress=False)
+        all_embeddings.extend(embeddings)
     
     # Save to cache
-    _global_cache.save_embeddings_batch(uncached_texts, uncached_embeddings, model)
+    _global_cache.save_embeddings_batch(uncached_texts, all_embeddings, model)
     
     # Combine results
     results = []
@@ -89,7 +100,7 @@ def get_embeddings_batch(texts: List[str], model: str = None) -> List[List[float
             results.append(cached_results[text])
         else:
             idx = uncached_texts.index(text)
-            results.append(uncached_embeddings[idx])
+            results.append(all_embeddings[idx])
     
     return results
 
@@ -106,7 +117,7 @@ def rerank_paper(candidate: List[ArxivPaper], corpus: List[Dict], model: str = N
     corpus_texts = [f"{paper['data']['title']} {paper['data']['abstractNote']}" for paper in corpus]
     
     # Get embeddings in batch
-    logger.info("Computing embeddings...")
+    logger.info(f"Getting embeddings for {len(candidate_texts)} candidate papers and {len(corpus_texts)} corpus papers...")
     candidate_embeddings = get_embeddings_batch(candidate_texts, model)
     corpus_embeddings = get_embeddings_batch(corpus_texts, model)
     
@@ -115,7 +126,7 @@ def rerank_paper(candidate: List[ArxivPaper], corpus: List[Dict], model: str = N
     corpus_embeddings = np.array(corpus_embeddings)
     
     # Compute similarities
-    logger.info("Computing similarities...")
+    logger.info("Computing similarities between papers...")
     similarities = np.dot(candidate_embeddings, corpus_embeddings.T)
     max_similarities = np.max(similarities, axis=1)
     
