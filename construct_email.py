@@ -16,7 +16,13 @@ import re
 from bs4 import BeautifulSoup
 import requests
 from openai import OpenAI
+import traceback
+from urllib.parse import urlencode, quote
+import logging
+import sys
 
+logger.remove()
+logger.add(sys.stdout, level="DEBUG")
 # 初始化缓存
 paper_cache = PaperCache()
 
@@ -129,20 +135,6 @@ framework = """
             color: #666;
         }
     </style>
-    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
-    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
-    <script>
-        MathJax = {
-            tex: {
-                inlineMath: [['$', '$'], ['\\(', '\\)']],
-                displayMath: [['$$', '$$'], ['\\[', '\\]']],
-                processEscapes: true
-            },
-            svg: {
-                fontCache: 'global'
-            }
-        };
-    </script>
 </head>
 <body>
     <h1>__TITLE__</h1>
@@ -154,32 +146,97 @@ framework = """
 """
 
 def get_empty_html(lang: str = "English") -> str:
-    """生成空结果的 HTML"""
+    """Generate empty result HTML"""
     if lang.lower() == "chinese":
         return """
-    <div class="empty-result">
-        <h2>没有找到相关论文</h2>
-        <p>今天没有与您的兴趣相关的新论文。请明天再来查看！</p>
-    </div>
-    """
+        <div class="empty-result">
+            <h2>没有找到相关论文</h2>
+            <p>今天没有与您的兴趣相关的新论文。请明天再来查看！</p>
+        </div>
+        """
     else:
         return """
-    <div class="empty-result">
-        <h2>No related papers found</h2>
-        <p>No new papers related to your interests today. Please check back tomorrow!</p>
-    </div>
-    """
+        <div class="empty-result">
+            <h2>No related papers found</h2>
+            <p>No new papers related to your interests today. Please check back tomorrow!</p>
+        </div>
+        """
+
+def normalize_math_delimiters(text: str) -> str:
+    """Normalize all math delimiters to $ and $$ format"""
+    logger.debug(f"Normalizing math delimiters in text: {text}")
+    # Convert \( and \) to $
+    text = re.sub(r'\\\((.*?)\\\)', r'$\1$', text)
+    # Convert \[ and \] to $$
+    text = re.sub(r'\\\[(.*?)\\\]', r'$$\1$$', text)
+    return text
+
+def process_math_for_email(text: str) -> str:
+    """Process math expressions in text and convert to images for email"""
+    logger.debug(f"Processing math for email in text: {text}")
+    
+    # Math pattern to match both inline ($...$) and display ($$...$$) math
+    math_pattern = r'(\$\$.*?\$\$|\$(?!\$).*?(?<!\$)\$)'
+    parts = re.split(math_pattern, text)
+    result = []
+    
+    for part in parts:
+        if part and (part.startswith('$') or part.startswith('$$')):
+            # Extract the math content without delimiters
+            is_display = part.startswith('$$')
+            math_content = part[2:-2] if is_display else part[1:-1]
+            
+            # Keep single backslashes for LaTeX commands
+            math_content = math_content.replace('\\\\', '\\')
+            
+            logger.debug(f"Found math expression: {math_content} (display: {is_display})")
+            
+            try:
+                # Prepare the parameters with proper escaping
+                params = {'tex': math_content if not is_display else '\\displaystyle ' + math_content}
+                # Make the request with proper URL encoding and error handling
+                response = requests.get('https://latex.vanabel.cn/api/', params=params, timeout=10)
+                
+                if response.status_code == 200 and response.content:
+                    logger.debug(f"Successfully rendered math: {math_content}")
+                    if is_display:
+                        result.append(
+                            f'<div style="text-align: center; margin: 1em 0;">'
+                            f'<img src="https://latex.vanabel.cn/api/?{urlencode(params)}" '
+                            f'alt="{math_content}" style="max-width: 100%; transform: scale(1); transform-origin: center;"/>'
+                            f'</div>'
+                        )
+                    else:
+                        result.append(
+                            f'<img src="https://latex.vanabel.cn/api/?{urlencode(params)}" '
+                            f'alt="{math_content}" '
+                            f'style="vertical-align: bottom; transform: scale(1); transform-origin: center; display: inline-block; margin: 0 0.1em;"/>'
+                        )
+                else:
+                    logger.error(f"Failed to fetch math image: {response.status_code} for {math_content}")
+                    result.append(f'<code style="font-family: monospace;">{part}</code>')
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Network error while rendering math expression: {math_content}, error: {e}")
+                result.append(f'<code style="font-family: monospace;">{part}</code>')
+            except Exception as e:
+                logger.error(f"Failed to render math expression: {math_content}, error: {e}")
+                result.append(f'<code style="font-family: monospace;">{part}</code>')
+        else:
+            result.append(part)
+    return ''.join(result)
+
+def process_math(text: str) -> str:
+    """Process math expressions in text and keep them as LaTeX"""
+    logger.debug(f"Processing math in text: {text}")
+    # First normalize all math delimiters to $ and $$
+    text = re.sub(r'\\\((.*?)\\\)', r'$\1$', text)
+    text = re.sub(r'\\\[(.*?)\\\]', r'$$\1$$', text)
+    # Clean up any remaining escaped characters
+    text = text.replace('\\', '')
+    return text
 
 def get_block_html(paper: ArxivPaper, lang: str = "English") -> str:
-    """Generate HTML block for a single paper
-    
-    Args:
-        paper: ArxivPaper object
-        lang: Language for the content (default: "English")
-        
-    Returns:
-        str: HTML block
-    """
+    """Generate HTML block for a single paper"""
     # Build similarity info HTML
     if lang.lower() == "chinese":
         rate_text = "相关度："
@@ -192,25 +249,49 @@ def get_block_html(paper: ArxivPaper, lang: str = "English") -> str:
     
     similarity_html = f'<div class="similarity">{similarity_text}{paper.score:.2f}</div>' if hasattr(paper, 'score') else ''
     
+    # Process title and abstract to handle math expressions
+    title = paper.title
+    abstract = paper.tldr
+    
+    logger.debug(f"Processing paper {paper.get_short_id()}")
+    logger.debug(f"Original title: {title}")
+    logger.debug(f"Original abstract: {abstract}")
+    
+    # Normalize math delimiters in title and abstract
+    title = re.sub(r'\\\((.*?)\\\)', r'$\1$', title)
+    title = re.sub(r'\\\[(.*?)\\\]', r'$$\1$$', title)
+    abstract = re.sub(r'\\\((.*?)\\\)', r'$\1$', abstract)
+    abstract = re.sub(r'\\\[(.*?)\\\]', r'$$\1$$', abstract)
+    
+    logger.debug(f"Normalized title: {title}")
+    logger.debug(f"Normalized abstract: {abstract}")
+    
+    # Process math in title and abstract
+    title = process_math(title)
+    abstract = process_math(abstract)
+    
+    logger.debug(f"Processed title: {title}")
+    logger.debug(f"Processed abstract: {abstract}")
+    
     return f"""
     <li>
-        <div class="paper">
-            <div class="header">
-                <div class="title">
-                    <a href="https://arxiv.org/abs/{paper.get_short_id()}" target="_blank">{paper.title}</a>
+    <div class="paper">
+        <div class="header">
+            <div class="title">
+                    <a href="https://arxiv.org/abs/{paper.get_short_id()}" target="_blank">{title}</a>
                 </div>
                 <div class="rate">
                     <div>{rate_text}<span class="stars">{get_stars(paper.score)}</span></div>
                     {similarity_html}
                 </div>
-            </div>
-            <div class="meta">
+        </div>
+        <div class="meta">
                 <div class="authors">{', '.join(paper.authors)}</div>
-                <div class="links">
+            <div class="links">
                     <a href="{paper.pdf_url}" target="_blank">{pdf_text}</a>
                 </div>
             </div>
-            <div class="abstract">{paper.tldr}</div>
+            <div class="abstract">{abstract}</div>
         </div>
     </li>
     """
@@ -230,29 +311,42 @@ def get_stars(score: float) -> str:
     return "★" * stars + "☆" * (5 - stars)
 
 def save_html_output(html: str, output_path: str = "output-email.html") -> None:
-    """Save the HTML content to a file with both interactive and pre-rendered versions"""
-    # Save interactive version (with MathJax)
+    """Save the HTML content to a file"""
     try:
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(html)
-        logger.info(f"Interactive email content saved to {output_path}")
-        
-        # Save pre-rendered version
-        pre_rendered_path = output_path.replace('.html', '-pre-rendered.html')
-        pre_rendered_html = pre_render_math(html)
-        with open(pre_rendered_path, 'w', encoding='utf-8') as f:
-            f.write(pre_rendered_html)
-        logger.info(f"Pre-rendered email content saved to {pre_rendered_path}")
-        
-        logger.info(f"You can open these files in a web browser to preview the email content")
+        logger.info(f"Email content saved to {output_path}")
+        logger.info(f"You can open this file in a web browser to preview the email content")
     except Exception as e:
         logger.error(f"Failed to save HTML output: {e}")
 
-def render_email(papers: List[ArxivPaper], lang: str = "English") -> str:
-    """Render email content"""
+def render_email(papers: List[ArxivPaper], lang: str = "English", for_email: bool = True) -> str:
+    """Render email content
+    
+    Args:
+        papers: List of papers to render
+        lang: Language for the email (default: "English")
+        for_email: Whether to convert math to images (True) or keep as LaTeX (False)
+    """
     if not papers:
         return get_empty_html(lang)
-        
+    
+    # Add MathJax script for HTML output
+    mathjax_script = """
+    <script type="text/javascript" async
+        src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.7/MathJax.js?config=TeX-MML-AM_CHTML">
+    </script>
+    <script type="text/x-mathjax-config">
+        MathJax.Hub.Config({
+            tex2jax: {
+                inlineMath: [['$','$']],
+                displayMath: [['$$','$$']],
+                processEscapes: true
+            }
+        });
+    </script>
+    """
+    
     # Initialize LLM for TLDR generation
     llm = get_llm()
     if isinstance(llm.llm, OpenAI):
@@ -263,59 +357,94 @@ def render_email(papers: List[ArxivPaper], lang: str = "English") -> str:
     # Generate TLDR for each paper with progress bar
     logger.info("Generating TLDR summaries...")
     for paper in tqdm(papers, desc="Generating TLDRs"):
-        paper.tldr = llm.get_tldr(paper.title, paper.summary)
+        # Try to get cached TLDR first
+        cached_tldr = paper_cache.get_tldr(paper.get_short_id())
+        if cached_tldr:
+            paper.tldr = cached_tldr
+            logger.debug(f"Using cached TLDR for paper {paper.get_short_id()}")
+        else:
+            # Generate new TLDR if not cached
+            paper.tldr = llm.get_tldr(paper.title, paper.summary)
+            # Cache the new TLDR
+            paper_cache.save_tldr(paper.get_short_id(), paper.tldr)
+            logger.debug(f"Cached new TLDR for paper {paper.get_short_id()}")
     
     # Render email content
     html = framework
+    # Add MathJax script for HTML output
+    if not for_email:
+        html = html.replace('</head>', f'{mathjax_script}</head>')
+    
     html = html.replace("__TITLE__", "ArXiv Daily Digest" if lang == "English" else "ArXiv 每日文摘")
     
     # Add papers
-    papers_html = ""
+    papers_html = []
     for paper in papers:
-        papers_html += get_block_html(paper, lang)
+        # Process title and abstract to handle math expressions
+        title = paper.title
+        abstract = paper.tldr
+        
+        logger.debug(f"Processing paper {paper.get_short_id()}")
+        logger.debug(f"Original title: {title}")
+        logger.debug(f"Original abstract: {abstract}")
+        
+        # Normalize math delimiters in both title and abstract
+        title = normalize_math_delimiters(title)
+        abstract = normalize_math_delimiters(abstract)
+        
+        logger.debug(f"Normalized title: {title}")
+        logger.debug(f"Normalized abstract: {abstract}")
+        
+        if for_email:
+            # For email, convert all math to SVG images
+            title = process_math_for_email(title)
+            abstract = process_math_for_email(abstract)
+        # For HTML output, keep the math expressions as is (with $ and $$)
+        
+        logger.debug(f"Processed title: {title}")
+        logger.debug(f"Processed abstract: {abstract}")
+        
+        # Build similarity info HTML
+        if lang.lower() == "chinese":
+            rate_text = "相关度："
+            pdf_text = "PDF"
+            similarity_text = "相似度："
+        else:
+            rate_text = "Relevance: "
+            pdf_text = "PDF"
+            similarity_text = "Similarity: "
+        
+        similarity_html = f'<div class="similarity">{similarity_text}{paper.score:.2f}</div>' if hasattr(paper, 'score') else ''
+        
+        # Generate HTML block for this paper
+        paper_html = f"""
+        <li>
+        <div class="paper">
+            <div class="header">
+                <div class="title">
+                        <a href="https://arxiv.org/abs/{paper.get_short_id()}" target="_blank">{title}</a>
+                    </div>
+                    <div class="rate">
+                        <div>{rate_text}<span class="stars">{get_stars(paper.score)}</span></div>
+                        {similarity_html}
+                    </div>
+            </div>
+            <div class="meta">
+                    <div class="authors">{', '.join(paper.authors)}</div>
+                <div class="links">
+                        <a href="{paper.pdf_url}" target="_blank">{pdf_text}</a>
+                    </div>
+                </div>
+                <div class="abstract">{abstract}</div>
+            </div>
+        </li>
+        """
+        papers_html.append(paper_html)
     
-    html = html.replace("__PAPERS__", papers_html)
-    save_html_output(html)
+    html = html.replace("__PAPERS__", "\n".join(papers_html))
+    if not for_email:
+        save_html_output(html)
     return html
-
-def pre_render_math(html_content: str) -> str:
-    """Pre-render math expressions to HTML using MathJax Node API"""
-    # Extract math expressions
-    inline_math = re.findall(r'\$([^$]+)\$', html_content)
-    display_math = re.findall(r'\$\$([^$]+)\$\$', html_content)
-    
-    # Replace math expressions with placeholders
-    math_expressions = inline_math + display_math
-    placeholders = []
-    for i, expr in enumerate(math_expressions):
-        placeholder = f'__MATH_{i}__'
-        html_content = html_content.replace(f'${expr}$', placeholder)
-        html_content = html_content.replace(f'$${expr}$$', placeholder)
-        placeholders.append(expr)
-    
-    # Use MathJax Node API to render math
-    rendered_math = []
-    for expr in placeholders:
-        try:
-            # Use MathJax Node API to render the expression
-            response = requests.post(
-                'https://mathjax-node.herokuapp.com/tex2svg',
-                json={'math': expr},
-                headers={'Content-Type': 'application/json'}
-            )
-            if response.status_code == 200:
-                rendered_math.append(response.text)
-            else:
-                rendered_math.append(f'<span class="math-error">Error rendering: {expr}</span>')
-        except Exception as e:
-            logger.error(f"Failed to render math expression: {expr}, error: {e}")
-            rendered_math.append(f'<span class="math-error">Error rendering: {expr}</span>')
-    
-    # Replace placeholders with rendered math
-    for i, rendered in enumerate(rendered_math):
-        html_content = html_content.replace(f'__MATH_{i}__', rendered)
-    
-    return html_content
 
 def send_email(sender: str, receiver: str, password: str, smtp_server: str, smtp_port: int, html: str, lang: str = "English"):
     """Send email with pre-rendered math content
@@ -329,9 +458,6 @@ def send_email(sender: str, receiver: str, password: str, smtp_server: str, smtp
         html: HTML content to send
         lang: Language for the email (default: "English")
     """
-    # Pre-render math expressions
-    html = pre_render_math(html)
-    
     def _format_addr(s, name):
         return formataddr((Header(name, 'utf-8').encode(), s))
 
